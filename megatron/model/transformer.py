@@ -1804,4 +1804,15 @@ class ParallelTransformer(MegatronModule):
             newkey = key.replace("layernorm", "norm")
             state_dict_[newkey] = state_dict[key]
 
+        if (int(os.getenv("NVTE_WEIGHT_QDQ_ON_CHECKPOINT_LOAD", "0"))
+            and self.transformer_impl == "transformer_engine"):
+            for key, value in state_dict_.items():
+                if "final_norm" in key:
+                    continue
+                param_name = key.split(".")[-1]
+                if "weight" in param_name and "norm" not in param_name:
+                    state_dict_[key] = transformer_engine.pytorch.fp8.qdq(
+                        value.to(torch.cuda.current_device()))
+                    del value
+
         super().load_state_dict(state_dict_, strict)
