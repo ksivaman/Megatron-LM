@@ -360,6 +360,12 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
+    gdn_kernel_backend: Literal["auto", "transformer_engine", "fla"] = "auto"
+    """Kernel backend for Gated DeltaNet. ``auto`` prefers TransformerEngine's GDN-enabled
+    DotProductAttention and falls back to the original flash-linear-attention implementation.
+    Explicit ``transformer_engine`` or ``fla`` selections disable this fallback. Deterministic
+    mode always uses the PyTorch-native implementation."""
+
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
 
@@ -1433,6 +1439,12 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+            )
+
+        if self.gdn_kernel_backend not in {"auto", "transformer_engine", "fla"}:
+            raise ValueError(
+                "gdn_kernel_backend must be one of {'auto', 'transformer_engine', 'fla'}, "
+                f"got {self.gdn_kernel_backend!r}."
             )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):

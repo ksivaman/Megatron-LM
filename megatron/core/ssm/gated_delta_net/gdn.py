@@ -5,6 +5,8 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import importlib
+import inspect
 from functools import partial
 from typing import Optional
 
@@ -12,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -19,10 +22,40 @@ from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
     causal_conv1d,
+    chunk_gated_delta_rule,
     get_parameter_local_cp,
     l2norm,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+
+
+_REQUIRED_TE_GDN_FORWARD_ARGS = {
+    "g",
+    "beta",
+    "initial_state",
+    "output_final_state",
+    "use_qk_l2norm_in_kernel",
+}
+
+
+def _get_te_gdn_dot_product_attention() -> type[torch.nn.Module] | None:
+    """Return TE DotProductAttention when its GDN API is available."""
+    if not HAVE_TE:
+        return None
+    try:
+        te_pytorch = importlib.import_module("transformer_engine.pytorch")
+        importlib.import_module("transformer_engine.pytorch.attention.dot_product_attention.gdn")
+        DotProductAttention = te_pytorch.DotProductAttention
+        forward_args = inspect.signature(DotProductAttention.forward).parameters
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return None
+    if not _REQUIRED_TE_GDN_FORWARD_ARGS.issubset(forward_args):
+        return None
+    return DotProductAttention
+
+
+_TE_GDN_DOT_PRODUCT_ATTENTION = _get_te_gdn_dot_product_attention()
+HAVE_TE_GDN = _TE_GDN_DOT_PRODUCT_ATTENTION is not None
 
 
 class GatedDeltaNet(_GDNBase):
@@ -55,27 +88,38 @@ class GatedDeltaNet(_GDNBase):
         self.a_log_dim = self.num_v_heads_local_tp
 
         if self.config.deterministic_mode:
+            self.gdn_backend = "torch"
             self.gated_delta_rule = torch_chunk_gated_delta_rule
-        else:
-            try:
-                from transformer_engine.pytorch import DotProductAttention
-            except ImportError as exc:
-                raise ImportError(
-                    "GDN requires TransformerEngine with fused Gated DeltaNet support."
-                ) from exc
+            return
 
-            # Q/K are expanded to the value-head count by
-            # `_prepare_input_for_gated_delta_rule`, so this DPA instance operates on
-            # the local head shard produced by the TP/CP all-to-all plumbing above.
-            num_local_heads = self.num_v_heads_local_tp // self.cp_size
-            self.core_attention = DotProductAttention(
-                num_attention_heads=num_local_heads,
-                kv_channels=(self.key_head_dim, self.value_head_dim),
-                qkv_format="bshd",
-                attn_mask_type="causal",
-                layer_number=self.layer_number,
-            )
-            self.gated_delta_rule = self._te_gated_delta_rule
+        requested_backend = self.config.gdn_kernel_backend
+        if requested_backend == "fla" or (requested_backend == "auto" and not HAVE_TE_GDN):
+            self.gdn_backend = "fla"
+            self.gated_delta_rule = chunk_gated_delta_rule
+            return
+
+        if not HAVE_TE_GDN:
+            if requested_backend == "transformer_engine":
+                raise ImportError(
+                    "gdn_kernel_backend='transformer_engine' requires TransformerEngine "
+                    "DotProductAttention with GDN support."
+                )
+            raise ValueError(f"Unsupported GDN kernel backend: {requested_backend!r}.")
+
+        # Q/K are expanded to the value-head count by
+        # `_prepare_input_for_gated_delta_rule`, so this DPA instance operates on
+        # the local head shard produced by the TP/CP all-to-all plumbing above.
+        self.gdn_backend = "transformer_engine"
+        num_local_heads = self.num_v_heads_local_tp // self.cp_size
+        assert _TE_GDN_DOT_PRODUCT_ATTENTION is not None
+        self.core_attention = _TE_GDN_DOT_PRODUCT_ATTENTION(
+            num_attention_heads=num_local_heads,
+            kv_channels=(self.key_head_dim, self.value_head_dim),
+            qkv_format="bshd",
+            attn_mask_type="causal",
+            layer_number=self.layer_number,
+        )
+        self.gated_delta_rule = self._te_gated_delta_rule
 
     def _te_gated_delta_rule(
         self,
