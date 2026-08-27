@@ -73,10 +73,12 @@ def _assert_relative_rms_close(
     )
 
 
-def _make_gdn_variant_stub(backend: str) -> SimpleNamespace:
+def _make_gdn_variant_stub(backend: str, *, deterministic_mode: bool = False) -> SimpleNamespace:
     """Build the minimal state needed to exercise GDN backend selection."""
     stub = SimpleNamespace(
-        config=SimpleNamespace(deterministic_mode=False, gdn_kernel_backend=backend),
+        config=SimpleNamespace(
+            deterministic_mode=deterministic_mode, gdn_kernel_backend=backend
+        ),
         num_value_heads=2,
         qk_dim_local_tp=64,
         v_dim_local_tp=128,
@@ -87,26 +89,24 @@ def _make_gdn_variant_stub(backend: str) -> SimpleNamespace:
         value_head_dim=64,
         layer_number=1,
     )
-    stub._te_gated_delta_rule = GatedDeltaNet._te_gated_delta_rule.__get__(stub, GatedDeltaNet)
     return stub
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-@pytest.mark.parametrize(("backend", "have_te"), [("auto", False), ("fla", True)])
-def test_gdn_selects_fla_backend(monkeypatch, backend, have_te):
-    """Auto falls back to FLA, and an explicit FLA selection bypasses TE."""
+def test_gdn_selects_fla_backend(monkeypatch):
+    """An explicit FLA selection bypasses TE."""
 
-    class UnexpectedDotProductAttention:
+    class UnexpectedTEGatedDeltaNetAttention:
         def __init__(self, **kwargs):
             raise AssertionError(f"TE should not be constructed: {kwargs}")
 
-    monkeypatch.setattr(gdn_module, "HAVE_TE_GDN", have_te)
+    monkeypatch.setattr(gdn_module, "HAVE_TE_GDN", True)
     monkeypatch.setattr(
         gdn_module,
-        "_TE_GDN_DOT_PRODUCT_ATTENTION",
-        UnexpectedDotProductAttention if have_te else None,
+        "TEGatedDeltaNetAttention",
+        UnexpectedTEGatedDeltaNetAttention,
     )
-    gdn = _make_gdn_variant_stub(backend)
+    gdn = _make_gdn_variant_stub("fla")
 
     GatedDeltaNet._setup_variant_attrs(gdn)
 
@@ -117,42 +117,79 @@ def test_gdn_selects_fla_backend(monkeypatch, backend, have_te):
 def test_gdn_rejects_unavailable_explicit_te_backend(monkeypatch):
     """An explicit TE selection fails instead of silently using FLA."""
     monkeypatch.setattr(gdn_module, "HAVE_TE_GDN", False)
-    monkeypatch.setattr(gdn_module, "_TE_GDN_DOT_PRODUCT_ATTENTION", None)
     gdn = _make_gdn_variant_stub("transformer_engine")
 
     with pytest.raises(ImportError, match="requires TransformerEngine DotProductAttention"):
         GatedDeltaNet._setup_variant_attrs(gdn)
 
 
-def test_gdn_auto_prefers_te_backend(monkeypatch):
-    """Auto selects TE when the GDN-enabled DPA API is available."""
+def test_gdn_selects_te_backend(monkeypatch):
+    """An explicit TE selection constructs the GDN-enabled DPA adapter."""
 
-    class FakeDotProductAttention:
+    class FakeTEGatedDeltaNetAttention:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
     monkeypatch.setattr(gdn_module, "HAVE_TE_GDN", True)
-    monkeypatch.setattr(gdn_module, "_TE_GDN_DOT_PRODUCT_ATTENTION", FakeDotProductAttention)
-    gdn = _make_gdn_variant_stub("auto")
+    monkeypatch.setattr(gdn_module, "TEGatedDeltaNetAttention", FakeTEGatedDeltaNetAttention)
+    gdn = _make_gdn_variant_stub("transformer_engine")
 
     GatedDeltaNet._setup_variant_attrs(gdn)
 
     assert gdn.gdn_backend == "transformer_engine"
-    assert isinstance(gdn.core_attention, FakeDotProductAttention)
-    assert gdn.gated_delta_rule == gdn._te_gated_delta_rule
+    assert isinstance(gdn.core_attention, FakeTEGatedDeltaNetAttention)
+    assert gdn.gated_delta_rule is gdn.core_attention
 
 
-def test_gdn_kernel_backend_validation():
+def test_gdn_selects_explicit_torch_backend():
+    """The PyTorch reference kernel is selected only when explicitly configured."""
+    gdn = _make_gdn_variant_stub("torch", deterministic_mode=True)
+
+    GatedDeltaNet._setup_variant_attrs(gdn)
+
+    assert gdn.gdn_backend == "torch"
+    assert gdn.gated_delta_rule is torch_chunk_gated_delta_rule
+
+
+@pytest.mark.parametrize("backend", ["transformer_engine", "fla"])
+def test_gdn_rejects_nondeterministic_backend_in_deterministic_mode(backend):
+    """Deterministic mode must not silently replace the configured backend."""
+    gdn = _make_gdn_variant_stub(backend, deterministic_mode=True)
+
+    with pytest.raises(ValueError, match="requires gdn_kernel_backend='torch'"):
+        GatedDeltaNet._setup_variant_attrs(gdn)
+
+
+@pytest.mark.parametrize("backend", ["transformer_engine", "fla"])
+def test_gdn_config_rejects_nondeterministic_backend_in_deterministic_mode(backend):
+    """Invalid deterministic GDN backend combinations fail during config construction."""
+    with pytest.raises(ValueError, match="requires gdn_kernel_backend='torch'"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=2,
+            experimental_attention_variant="gated_delta_net",
+            deterministic_mode=True,
+            gdn_kernel_backend=backend,
+        )
+
+
+@pytest.mark.parametrize("backend", ["auto", "unsupported"])
+def test_gdn_kernel_backend_validation(backend):
     """Direct config construction rejects unsupported GDN backend names."""
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=2)
-    assert config.gdn_kernel_backend == "auto"
+    assert config.gdn_kernel_backend == "fla"
+    torch_config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=2, gdn_kernel_backend="torch"
+    )
+    assert torch_config.gdn_kernel_backend == "torch"
 
     with pytest.raises(ValueError, match="gdn_kernel_backend must be one of"):
         TransformerConfig(
             num_layers=1,
             hidden_size=128,
             num_attention_heads=2,
-            gdn_kernel_backend="unsupported",
+            gdn_kernel_backend=backend,
         )
 
 
@@ -207,6 +244,7 @@ class TestGatedDeltaNet:
             sequence_parallel=sp,
             context_parallel_size=cp_size,
             experimental_attention_variant="gdn2" if use_gdn2 else "gated_delta_net",
+            gdn_kernel_backend="fla",
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
         )
@@ -343,6 +381,7 @@ class TestGatedDeltaNet:
 
         det_config = copy.deepcopy(self.transformer_config)
         det_config.deterministic_mode = True
+        det_config.gdn_kernel_backend = "torch"
 
         gdn_spec = get_experimental_attention_variant_module_spec(config=det_config)
 
@@ -364,7 +403,8 @@ class TestGatedDeltaNet:
             .bfloat16()
         )
 
-        # deterministic_mode must select the variant's torch-native kernel, not FLA.
+        # The deterministic configuration explicitly selects the variant's torch-native kernel.
+        assert gdn.gdn_backend == "torch"
         if self.use_gdn2:
             assert isinstance(gdn, GatedDeltaNet2)
             assert gdn.gated_delta_rule is torch_chunk_gdn2
@@ -415,12 +455,8 @@ class TestGatedDeltaNet:
             assert gdn.dt_bias.shape == (gdn.qk_dim // self.tp_size,)
         else:
             assert isinstance(gdn, GatedDeltaNet)
-            if gdn.gdn_backend == "transformer_engine":
-                assert gdn.gated_delta_rule == gdn._te_gated_delta_rule
-                assert hasattr(gdn, "core_attention")
-            else:
-                assert gdn.gdn_backend == "fla"
-                assert gdn.gated_delta_rule is chunk_gated_delta_rule
+            assert gdn.gdn_backend == "fla"
+            assert gdn.gated_delta_rule is chunk_gated_delta_rule
             assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
             assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
             assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
@@ -713,8 +749,7 @@ def test_te_gdn_matches_previous_fla_path():
             (output.float() * output_grad).sum().backward()
             return output.detach(), {name: tensor.grad.detach() for name, tensor in inputs.items()}
 
-        te_gated_delta_rule = gdn._te_gated_delta_rule
-        assert gdn.gated_delta_rule == te_gated_delta_rule
+        te_gated_delta_rule = gdn.gated_delta_rule
         te_output, te_grads = run(te_gated_delta_rule)
         fla_output, fla_grads = run(chunk_gated_delta_rule)
 
@@ -798,6 +833,7 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         activation_func=F.silu,
         bf16=True,
         experimental_attention_variant="gated_delta_net",
+        gdn_kernel_backend="fla",
         linear_attention_freq=[1],
         transformer_impl="transformer_engine",
     )
@@ -849,6 +885,7 @@ def test_parallel_gated_delta_net2_correctness(tmp_path_dist_ckpt, sequence_pack
         activation_func=F.silu,
         bf16=True,
         experimental_attention_variant="gdn2",
+        gdn_kernel_backend="fla",
         linear_attention_freq=[1],
         transformer_impl="transformer_engine",
     )

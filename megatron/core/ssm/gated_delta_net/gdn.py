@@ -5,8 +5,6 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-import importlib
-import inspect
 from functools import partial
 from typing import Optional
 
@@ -14,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
@@ -38,34 +36,6 @@ try:
 except ImportError:
     causal_conv1d_update = None
     fused_recurrent_gated_delta_rule = None
-
-_REQUIRED_TE_GDN_FORWARD_ARGS = {
-    "g",
-    "beta",
-    "initial_state",
-    "output_final_state",
-    "use_qk_l2norm_in_kernel",
-}
-
-
-def _get_te_gdn_dot_product_attention() -> type[torch.nn.Module] | None:
-    """Return TE DotProductAttention when its GDN API is available."""
-    if not HAVE_TE:
-        return None
-    try:
-        te_pytorch = importlib.import_module("transformer_engine.pytorch")
-        importlib.import_module("transformer_engine.pytorch.attention.dot_product_attention.gdn")
-        DotProductAttention = te_pytorch.DotProductAttention
-        forward_args = inspect.signature(DotProductAttention.forward).parameters
-    except (AttributeError, ImportError, TypeError, ValueError):
-        return None
-    if not _REQUIRED_TE_GDN_FORWARD_ARGS.issubset(forward_args):
-        return None
-    return DotProductAttention
-
-
-_TE_GDN_DOT_PRODUCT_ATTENTION = _get_te_gdn_dot_product_attention()
-HAVE_TE_GDN = _TE_GDN_DOT_PRODUCT_ATTENTION is not None
 
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
@@ -98,85 +68,41 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         self.a_log_dim = self.num_v_heads_local_tp
         self.chunk_size = 64
 
-        if self.config.deterministic_mode:
+        backend = self.config.gdn_kernel_backend
+        if self.config.deterministic_mode and backend != "torch":
+            raise ValueError(
+                "deterministic_mode=True requires gdn_kernel_backend='torch' for "
+                "Gated DeltaNet."
+            )
+
+        if backend == "torch":
             self.gdn_backend = "torch"
             self.gated_delta_rule = torch_chunk_gated_delta_rule
             return
 
-        requested_backend = self.config.gdn_kernel_backend
-        if requested_backend == "fla" or (requested_backend == "auto" and not HAVE_TE_GDN):
+        if backend == "fla":
             self.gdn_backend = "fla"
             self.gated_delta_rule = chunk_gated_delta_rule
             return
 
         if not HAVE_TE_GDN:
-            if requested_backend == "transformer_engine":
-                raise ImportError(
-                    "gdn_kernel_backend='transformer_engine' requires TransformerEngine "
-                    "DotProductAttention with GDN support."
-                )
-            raise ValueError(f"Unsupported GDN kernel backend: {requested_backend!r}.")
+            raise ImportError(
+                "gdn_kernel_backend='transformer_engine' requires TransformerEngine "
+                "DotProductAttention with GDN support."
+            )
 
         # Q/K are expanded to the value-head count by
         # `_prepare_input_for_gated_delta_rule`, so this DPA instance operates on
         # the local head shard produced by the TP/CP all-to-all plumbing above.
         self.gdn_backend = "transformer_engine"
         num_local_heads = self.num_v_heads_local_tp // self.cp_size
-        assert _TE_GDN_DOT_PRODUCT_ATTENTION is not None
-        self.core_attention = _TE_GDN_DOT_PRODUCT_ATTENTION(
+        self.core_attention = TEGatedDeltaNetAttention(
             num_attention_heads=num_local_heads,
-            kv_channels=(self.key_head_dim, self.value_head_dim),
-            qkv_format="bshd",
-            attn_mask_type="causal",
+            qk_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
             layer_number=self.layer_number,
         )
-        self.gated_delta_rule = self._te_gated_delta_rule
-
-    def _te_gated_delta_rule(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        initial_state: torch.Tensor | None = None,
-        output_final_state: bool = False,
-        use_qk_l2norm_in_kernel: bool = False,
-        cu_seqlens: torch.Tensor | None = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Adapt Megatron GDN tensors to TransformerEngine's fused GDN API."""
-        del kwargs
-
-        batch, sequence = q.shape[:2]
-        qkv_format = "bshd"
-        if cu_seqlens is not None:
-            qkv_format = "thd"
-            q, k, v = (tensor.reshape(-1, *tensor.shape[2:]) for tensor in (q, k, v))
-            g, beta = (tensor.reshape(-1, tensor.shape[-1]) for tensor in (g, beta))
-
-        result = self.core_attention(
-            q,
-            k,
-            v,
-            attention_mask=None,
-            qkv_format=qkv_format,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            g=g.float(),
-            beta=beta.float(),
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        )
-        if output_final_state:
-            output, final_state = result
-        else:
-            output = result
-            final_state = None
-
-        output = output.reshape(batch, sequence, -1, self.value_head_dim)
-        return output, final_state
+        self.gated_delta_rule = self.core_attention
 
     @jit_fuser
     def _compute_gates(
@@ -219,9 +145,11 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         if inference_context is not None:
             if inference_context.is_dynamic_batching():
-                assert (
-                    not self.config.deterministic_mode
-                ), "GDN dynamic inference requires the FLA recurrent kernels."
+                if self.gdn_backend != "fla":
+                    raise ValueError(
+                        "GDN dynamic inference requires gdn_kernel_backend='fla' because "
+                        "only the FLA recurrent kernels are supported."
+                    )
                 assert (
                     not self.config.batch_invariant_mode
                 ), "GDN dynamic inference does not support batch-invariant mode."
