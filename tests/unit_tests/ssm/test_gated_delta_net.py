@@ -1,18 +1,15 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-import os
 from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 import megatron.core.ssm.gated_delta_net.gdn as gdn_module
 from megatron.core import parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
-    get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import (
@@ -33,29 +30,8 @@ from megatron.core.ssm.gated_delta_net.common import (
     tensor_a2a_hp2cp,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
-from tests.unit_tests.transformer.test_multi_latent_attention import (
-    make_test_packed_seq_params,
-    make_test_packed_seq_params_with_padding,
-)
-
-# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-multi-rank-gpu-enable
-# NVLS doesn't support one single GPU to be shared by multiple ranks, so disable this in test
-os.environ.update({"NCCL_NVLS_ENABLE": "0"})
-
-
-def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[torch.Tensor]:
-    unpacked_x = []
-    cu_seqlens_list = cu_seqlens.tolist()
-    num_seqs = len(cu_seqlens_list) - 1
-    for i in range(num_seqs):
-        idx_start = cu_seqlens_list[i]
-        idx_end = cu_seqlens_list[i + 1]
-        chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
-        unpacked_x.append(x[tuple(chunked_index)])
-    return unpacked_x
+from tests.unit_tests.ssm.gated_delta_net_test_utils import GatedDeltaNetTestBase
+from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
 
 
 def _assert_relative_rms_close(
@@ -200,71 +176,7 @@ def test_gdn_kernel_backend_validation(backend):
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
-class TestGatedDeltaNet:
-
-    @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self, tp_size, sp, cp_size, use_gdn2):
-        if use_gdn2 and not HAVE_FLA_GDN2:
-            pytest.skip("FLA with GDN2 support is not installed.")
-
-        # Initialize parallel and random seed
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tp_size,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=cp_size,
-        )
-        model_parallel_cuda_manual_seed(123)
-        self.tp_size = tp_size
-        self.cp_size = cp_size
-        self.sp_size = tp_size if sp else 1
-        self.use_gdn2 = use_gdn2
-
-        # Get TP and CP process groups from device mesh
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
-        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
-
-        # Initialize model, with the same config as Qwen Next except `num_layers`
-        self.transformer_config = TransformerConfig(
-            hidden_size=2048,
-            linear_conv_kernel_dim=4,
-            linear_key_head_dim=128,
-            linear_value_head_dim=128,
-            linear_num_key_heads=16,
-            linear_num_value_heads=32,
-            num_layers=1,
-            normalization="RMSNorm",
-            use_cpu_initialization=True,
-            layernorm_zero_centered_gamma=True,
-            num_attention_heads=16,
-            num_query_groups=2,
-            activation_func=F.silu,
-            bf16=True,
-            tensor_model_parallel_size=tp_size,
-            sequence_parallel=sp,
-            context_parallel_size=cp_size,
-            experimental_attention_variant="gdn2" if use_gdn2 else "gated_delta_net",
-            gdn_kernel_backend="fla",
-            linear_attention_freq=[1],
-            transformer_impl="transformer_engine",
-        )
-        gdn_spec = get_experimental_attention_variant_module_spec(config=self.transformer_config)
-
-        self.gdn = gdn_spec.module(
-            self.transformer_config,
-            submodules=gdn_spec.submodules,
-            layer_number=1,
-            bias=False,
-            conv_bias=False,
-            conv_init=1.0,
-            use_qk_l2norm=True,
-            A_init_range=(1, 16),
-            pg_collection=pg_collection,
-        )
-        self.gdn = self.gdn.cuda().bfloat16()
-
-    def teardown_method(self):
-        Utils.destroy_model_parallel()
+class TestGatedDeltaNet(GatedDeltaNetTestBase):
 
     def test_gpu_forward(self):
         gdn = self.gdn
@@ -295,84 +207,54 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
-    def test_selective_recompute_norm_out(self):
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
-        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+    def test_gpu_forward_thd_correctness(self):
+        if self.sp_size > 1:
+            pytest.skip("Sequence parallel is not supported for this test case.")
 
-        def build_gdn(config):
-            gdn_spec = get_experimental_attention_variant_module_spec(config=config)
-            gdn = gdn_spec.module(
-                config,
-                submodules=gdn_spec.submodules,
-                layer_number=1,
-                bias=False,
-                conv_bias=False,
-                conv_init=1.0,
-                use_qk_l2norm=True,
-                A_init_range=(1, 16),
-                pg_collection=pg_collection,
-            )
-            return gdn.cuda().bfloat16()
+        if self.use_gdn2:
+            # FLA uses different kernels for SBHD and THD:
+            # https://github.com/fla-org/flash-linear-attention/blob/ebf3a0cff2be3e6f2b2f99820b8fe4e28855ced0/fla/ops/gdn2/chunk_intra.py#L40-L53
+            # so we relax the error bound here
+            atol, rtol = 1e-2, 1e-2
+        else:
+            atol, rtol = 3e-4, 3e-4
 
-        def run(gdn, hidden_states):
-            output, _ = gdn(hidden_states, None)
-            output.float().sum().backward()
-            grads = {
-                name: param.grad.detach()
-                for name, param in gdn.named_parameters()
-                if param.grad is not None
-            }
-            input_grad = hidden_states.grad.detach().clone()
-            return output.detach(), grads, input_grad
-
-        micro_batch_size = 2
-        seq_length = 64
-        base_config = copy.deepcopy(self.transformer_config)
-        rec_config = copy.deepcopy(self.transformer_config)
-        rec_config.recompute_granularity = "selective"
-        rec_config.recompute_modules = ["gdn_norm_out"]
-
-        model_parallel_cuda_manual_seed(42)
-        torch.manual_seed(42)
-        hidden_states = torch.randn(
-            (
-                seq_length // self.sp_size // self.cp_size,
-                micro_batch_size,
-                self.gdn.config.hidden_size,
-            ),
-            device=torch.cuda.current_device(),
-            dtype=torch.bfloat16,
-            requires_grad=True,
+        # Input shape
+        sequence_length = 32
+        micro_batch_size = 4
+        cu_seqlens = [0, 32, 64, 96, 128]
+        # sbhd input shape: [sequence length, batch size, hidden size]
+        sub_sequence_length = sequence_length // self.cp_size
+        hidden_states_sbhd = torch.rand(
+            (sub_sequence_length, micro_batch_size, self.gdn.config.hidden_size)
         )
+        attention_mask_sbhd = None
+        hidden_states_sbhd = hidden_states_sbhd.cuda().bfloat16()
+        # thd input shape: [sequence length * batch size, 1, hidden size]
+        hidden_states_thd = hidden_states_sbhd.transpose(0, 1).contiguous()
+        hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
+        attention_mask_thd = None
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
-        # --- Baseline (no recompute) ---
-        model_parallel_cuda_manual_seed(42)
-        torch.manual_seed(42)
-        base_gdn = build_gdn(base_config)
-        assert base_gdn.recompute_norm_out is False
-        base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
-        hidden_states.grad = None
-        assert base_gdn.norm_out_checkpoint is None
-        del base_gdn
-        torch.cuda.empty_cache()
-
-        # --- Recompute ---
-        model_parallel_cuda_manual_seed(42)
-        torch.manual_seed(42)
-        rec_gdn = build_gdn(rec_config)
-        assert rec_gdn.recompute_norm_out is True
-        rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
-        assert rec_gdn.norm_out_checkpoint is not None
+        # THD format
+        output_thd, _ = self.gdn(
+            hidden_states_thd, attention_mask_thd, packed_seq_params=packed_seq_params
+        )
+        # SBHD format
+        output_sbhd, _ = self.gdn(hidden_states_sbhd, attention_mask_sbhd)
+        output_sbhd_T = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
 
         rank = torch.distributed.get_rank()
-        assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"
-        assert torch.equal(rec_input_grad, base_input_grad), f"Input grad not identical ({rank=})"
-        assert set(rec_grads.keys()) == set(base_grads.keys())
-        for name in base_grads:
-            assert torch.equal(
-                rec_grads[name], base_grads[name]
-            ), f"Grad not identical for {name} ({rank=})"
+        assert output_thd.shape[0] == sub_sequence_length * micro_batch_size
+        assert output_thd.shape[1] == 1
+        assert output_thd.shape[2] == self.gdn.config.hidden_size
+        torch.testing.assert_close(
+            output_sbhd_T,
+            output_thd,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg: f"Output mismatch ({rank=}): {msg}",
+        )
 
     def test_deterministic_mode(self):
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -547,117 +429,6 @@ class TestGatedDeltaNet:
             assert beta.shape == (batch, seq_len, num_v_heads_local)
             assert (g <= 0).all()
             assert (beta >= 0).all() and (beta <= 1).all()
-
-    def test_gpu_forward_thd_correctness(self):
-        if self.sp_size > 1:
-            pytest.skip("Sequence parallel is not supported for this test case.")
-
-        if self.use_gdn2:
-            # FLA uses different kernels for SBHD and THD:
-            # https://github.com/fla-org/flash-linear-attention/blob/ebf3a0cff2be3e6f2b2f99820b8fe4e28855ced0/fla/ops/gdn2/chunk_intra.py#L40-L53
-            # so we relax the error bound here
-            atol, rtol = 1e-2, 1e-2
-        else:
-            atol, rtol = 3e-4, 3e-4
-
-        # Input shape
-        sequence_length = 32
-        micro_batch_size = 4
-        cu_seqlens = [0, 32, 64, 96, 128]
-        # sbhd input shape: [sequence length, batch size, hidden size]
-        sub_sequence_length = sequence_length // self.cp_size
-        hidden_states_sbhd = torch.rand(
-            (sub_sequence_length, micro_batch_size, self.gdn.config.hidden_size)
-        )
-        attention_mask_sbhd = None
-        hidden_states_sbhd = hidden_states_sbhd.cuda().bfloat16()
-        # thd input shape: [sequence length * batch size, 1, hidden size]
-        hidden_states_thd = hidden_states_sbhd.transpose(0, 1).contiguous()
-        hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
-        attention_mask_thd = None
-        packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
-
-        # THD format
-        output_thd, _ = self.gdn(
-            hidden_states_thd, attention_mask_thd, packed_seq_params=packed_seq_params
-        )
-        # SBHD format
-        output_sbhd, _ = self.gdn(hidden_states_sbhd, attention_mask_sbhd)
-        output_sbhd_T = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
-
-        rank = torch.distributed.get_rank()
-        assert output_thd.shape[0] == sub_sequence_length * micro_batch_size
-        assert output_thd.shape[1] == 1
-        assert output_thd.shape[2] == self.gdn.config.hidden_size
-        torch.testing.assert_close(
-            output_sbhd_T,
-            output_thd,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Output mismatch ({rank=}): {msg}",
-        )
-
-    def test_gpu_forward_thd_padding_correctness(self):
-        if self.sp_size > 1:
-            pytest.skip("Sequence parallel is not supported for this test case.")
-
-        if self.use_gdn2:
-            # See test_gpu_forward_thd_correctness: varlen vs batched kernel paths only
-            # match up to bf16 ULP-level differences for GDN2.
-            atol, rtol = 1e-2, 1e-2
-        else:
-            atol, rtol = 3e-4, 3e-4
-        sequence_length = 32
-        micro_batch_size = 4
-
-        # sbhd input shape: [sequence length, batch size, hidden size]
-        sub_sequence_length = sequence_length // self.cp_size
-        hidden_states_sbhd = torch.rand(
-            (sub_sequence_length, micro_batch_size, self.gdn.config.hidden_size),
-            device=torch.cuda.current_device(),
-            dtype=torch.bfloat16,
-        )
-        output_sbhd, _ = self.gdn(hidden_states_sbhd, None)
-
-        # thd input shape: [sequence length * batch size, 1, hidden size]
-        hidden_states_thd = hidden_states_sbhd.transpose(0, 1).contiguous()
-        hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
-        output_bshd = output_sbhd.transpose(0, 1).contiguous()
-
-        rank = torch.distributed.get_rank()
-
-        # A) padded branch: prefer *_padded when available.
-        padded_params = make_test_packed_seq_params_with_padding(
-            cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 128]
-        )
-        output_thd_padded, _ = self.gdn(hidden_states_thd, None, packed_seq_params=padded_params)
-        output_thd2bshd = output_thd_padded.view(*output_bshd.shape)
-        torch.testing.assert_close(
-            output_bshd[:, :30, :],
-            output_thd2bshd[:, :30, :],
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"THD padded output mismatch ({rank=}): {msg}",
-        )
-
-        # B) no-padded branch: use actual cu_seqlens when it matches total_sequence_length.
-        no_padding_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 128])
-        output_thd_no_padding, _ = self.gdn(
-            hidden_states_thd, None, packed_seq_params=no_padding_params
-        )
-        assert output_thd_no_padding.shape == output_thd_padded.shape
-
-        # C) padded mismatch branch: if *_padded[-1] mismatches total_sequence_length, should raise.
-        padded_mismatch_params = make_test_packed_seq_params_with_padding(
-            cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 126]
-        )
-        with pytest.raises(ValueError, match="does not match"):
-            self.gdn(hidden_states_thd, None, packed_seq_params=padded_mismatch_params)
-
-        # D) actual mismatch branch without *_padded: should raise.
-        actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
-        with pytest.raises(ValueError, match="does not match"):
-            self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
 
 
 @pytest.mark.skipif(not HAVE_TE_GDN, reason="TransformerEngine GDN is not available.")
