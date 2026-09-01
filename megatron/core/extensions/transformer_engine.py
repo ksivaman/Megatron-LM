@@ -85,33 +85,20 @@ except ImportError:
         te = MagicMock()
         HAVE_TE = False
 
-_REQUIRED_TE_GDN_FORWARD_ARGS = {
-    "g",
-    "beta",
-    "initial_state",
-    "output_final_state",
-    "use_qk_l2norm_in_kernel",
-}
-
-
-def _get_te_gdn_dot_product_attention() -> type[torch.nn.Module] | None:
-    """Return TE DotProductAttention when its GDN API is available."""
+def _get_te_linear_attention() -> type[torch.nn.Module] | None:
+    """Return TE's LinearAttention (Gated DeltaNet) module, if available."""
     if not HAVE_TE:
         return None
     try:
         te_pytorch = importlib.import_module("transformer_engine.pytorch")
-        importlib.import_module("transformer_engine.pytorch.attention.dot_product_attention.gdn")
-        dot_product_attention = te_pytorch.DotProductAttention
-        forward_args = inspect.signature(dot_product_attention.forward).parameters
-    except (AttributeError, ImportError, TypeError, ValueError):
+        importlib.import_module("transformer_engine.pytorch.attention.linear_attention.gdn")
+        return te_pytorch.LinearAttention
+    except (AttributeError, ImportError):
         return None
-    if not _REQUIRED_TE_GDN_FORWARD_ARGS.issubset(forward_args):
-        return None
-    return dot_product_attention
 
 
-_TE_GDN_DOT_PRODUCT_ATTENTION = _get_te_gdn_dot_product_attention()
-HAVE_TE_GDN = _TE_GDN_DOT_PRODUCT_ATTENTION is not None
+_TE_LINEAR_ATTENTION = _get_te_linear_attention()
+HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
@@ -2068,7 +2055,7 @@ class TERowParallelLinear(TELinear):
 
 
 class TEGatedDeltaNetAttention(torch.nn.Module):
-    """Adapt Megatron GDN kernel inputs to Transformer Engine DotProductAttention."""
+    """Adapt Megatron GDN kernel inputs to Transformer Engine's LinearAttention."""
 
     def __init__(
         self,
@@ -2079,12 +2066,10 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
     ) -> None:
         super().__init__()
         if not HAVE_TE_GDN:
-            raise ImportError(
-                "Transformer Engine DotProductAttention with GDN support is not available."
-            )
-        assert _TE_GDN_DOT_PRODUCT_ATTENTION is not None
+            raise ImportError("Transformer Engine LinearAttention (GDN) is not available.")
+        assert _TE_LINEAR_ATTENTION is not None
         self.value_head_dim = value_head_dim
-        self.te_attention = _TE_GDN_DOT_PRODUCT_ATTENTION(
+        self.te_attention = _TE_LINEAR_ATTENTION(
             num_attention_heads=num_attention_heads,
             kv_channels=(qk_head_dim, value_head_dim),
             qkv_format="bshd",
@@ -2119,7 +2104,6 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
             q,
             k,
             v,
-            attention_mask=None,
             qkv_format=qkv_format,
             cu_seqlens_q=cu_seqlens,
             g=g.float(),
